@@ -1,17 +1,11 @@
 pipeline {
     agent any
 
-    options {
-        timestamps()
-        disableConcurrentBuilds()
-    }
-
     environment {
-        IMAGE_NAME = 'gopikaks/online-food-ordering-portal'
+        DOCKER_IMAGE = 'gopikaks/online-food-ordering-portal'
         SERVICE_NAME = 'foodie-service'
-        PREVIOUS_SLOT = ''
-        TARGET_SLOT = ''
-        TRAFFIC_SWITCHED = 'false'
+        TEST_PORT = '18082'
+        NODE_PORT = '30012'
     }
 
     stages {
@@ -23,68 +17,52 @@ pipeline {
 
         stage('Build Docker Image') {
             steps {
-                bat 'docker build -t %IMAGE_NAME%:%BUILD_NUMBER% .'
+                script {
+                    env.IMAGE_TAG = "${BUILD_NUMBER}"
+                }
+                bat 'docker build -t %DOCKER_IMAGE%:%IMAGE_TAG% .'
             }
         }
 
         stage('Test Website') {
             steps {
                 bat '''
-                    docker rm -f foodie-test-%BUILD_NUMBER% 2>NUL
-                    docker run -d --name foodie-test-%BUILD_NUMBER% -p 18082:80 %IMAGE_NAME%:%BUILD_NUMBER%
+                    docker rm -f foodie-test 2>NUL
+                    docker run -d --name foodie-test -p %TEST_PORT%:80 %DOCKER_IMAGE%:%IMAGE_TAG%
                     if errorlevel 1 exit /b 1
                 '''
-
                 powershell '''
-                    $ready = $false
-
-                    for ($i = 0; $i -lt 15; $i++) {
-                        try {
-                            $response = Invoke-WebRequest `
-                                -Uri "http://localhost:18082/" `
-                                -TimeoutSec 3 `
-                                -UseBasicParsing
-
-                            if ($response.StatusCode -eq 200) {
-                                $ready = $true
-                                break
-                            }
+                    Start-Sleep -Seconds 5
+                    try {
+                        $response = Invoke-WebRequest -Uri "http://localhost:$env:TEST_PORT/" -UseBasicParsing -TimeoutSec 10
+                        if ($response.StatusCode -ne 200) {
+                            throw "Website test failed"
                         }
-                        catch {
-                            Start-Sleep -Seconds 2
-                        }
+                        Write-Host "FoodieExpress website test passed."
+                    } catch {
+                        docker logs foodie-test
+                        exit 1
                     }
-
-                    if (-not $ready) {
-                        throw "FoodieExpress website test failed."
-                    }
-
-                    Write-Host "FoodieExpress website test passed."
                 '''
             }
         }
 
         stage('Push Docker Image') {
             steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'dockerhub',
-                        usernameVariable: 'DH_USER',
-                        passwordVariable: 'DH_TOKEN'
-                    )
-                ]) {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub',
+                    usernameVariable: 'DH_USER',
+                    passwordVariable: 'DH_TOKEN'
+                )]) {
                     bat '''
                         docker login -u "%DH_USER%" -p "%DH_TOKEN%"
                         if errorlevel 1 exit /b 1
-
-                        docker push %IMAGE_NAME%:%BUILD_NUMBER%
+                        docker push %DOCKER_IMAGE%:%IMAGE_TAG%
                         if errorlevel 1 exit /b 1
-
-                        docker tag %IMAGE_NAME%:%BUILD_NUMBER% %IMAGE_NAME%:latest
+                        docker tag %DOCKER_IMAGE%:%IMAGE_TAG% %DOCKER_IMAGE%:latest
+                        docker push %DOCKER_IMAGE%:latest
                         if errorlevel 1 exit /b 1
-
-                        docker push %IMAGE_NAME%:latest
-                        if errorlevel 1 exit /b 1
+                        docker logout
                     '''
                 }
             }
@@ -92,30 +70,29 @@ pipeline {
 
         stage('Identify Blue-Green Target') {
             steps {
-                withCredentials([
-                    file(
-                        credentialsId: 'kuberconfig',
-                        variable: 'KUBECONFIG_FILE'
-                    )
-                ]) {
+                withCredentials([file(
+                    credentialsId: 'kuberconfig',
+                    variable: 'KUBECONFIG_FILE'
+                )]) {
                     script {
-                        def active = bat(
-                            returnStdout: true,
-                            script: '''
-                                @echo off
-                                kubectl --kubeconfig="%KUBECONFIG_FILE%" get service foodie-service -o "jsonpath={.spec.selector.slot}"
-                            '''
+                        def activeSlot = bat(
+                            script: '@echo off\r\nset "KUBECONFIG=%KUBECONFIG_FILE%"\r\nkubectl get service foodie-service -o jsonpath={.spec.selector.slot}',
+                            returnStdout: true
                         ).trim()
 
-                        if (active != 'blue' && active != 'green') {
-                            error("Unexpected active slot: ${active}")
+                        if (activeSlot.endsWith('blue')) {
+                            activeSlot = 'blue'
+                        } else if (activeSlot.endsWith('green')) {
+                            activeSlot = 'green'
+                        } else {
+                            error("Could not detect active slot: ${activeSlot}")
                         }
 
-                        env.PREVIOUS_SLOT = active
-                        env.TARGET_SLOT = active == 'blue' ? 'green' : 'blue'
+                        env.ACTIVE_SLOT = activeSlot
+                        env.NEXT_SLOT = activeSlot == 'blue' ? 'green' : 'blue'
 
-                        echo "Current active slot: ${env.PREVIOUS_SLOT}"
-                        echo "New release target: ${env.TARGET_SLOT}"
+                        echo "Current active slot: ${env.ACTIVE_SLOT}"
+                        echo "New release target: ${env.NEXT_SLOT}"
                     }
                 }
             }
@@ -123,17 +100,16 @@ pipeline {
 
         stage('Deploy to Inactive Environment') {
             steps {
-                withCredentials([
-                    file(
-                        credentialsId: 'kuberconfig',
-                        variable: 'KUBECONFIG_FILE'
-                    )
-                ]) {
+                withCredentials([file(
+                    credentialsId: 'kuberconfig',
+                    variable: 'KUBECONFIG_FILE'
+                )]) {
                     bat '''
-                        kubectl --kubeconfig="%KUBECONFIG_FILE%" set image deployment/foodie-%TARGET_SLOT% foodie=%IMAGE_NAME%:%BUILD_NUMBER%
+                        @echo off
+                        set "KUBECONFIG=%KUBECONFIG_FILE%"
+                        kubectl set image deployment/foodie-%NEXT_SLOT% foodie=%DOCKER_IMAGE%:%IMAGE_TAG%
                         if errorlevel 1 exit /b 1
-
-                        kubectl --kubeconfig="%KUBECONFIG_FILE%" rollout status deployment/foodie-%TARGET_SLOT% --timeout=180s
+                        kubectl rollout status deployment/foodie-%NEXT_SLOT% --timeout=180s
                         if errorlevel 1 exit /b 1
                     '''
                 }
@@ -142,111 +118,52 @@ pipeline {
 
         stage('Switch Traffic') {
             steps {
-                withCredentials([
-                    file(
-                        credentialsId: 'kuberconfig',
-                        variable: 'KUBECONFIG_FILE'
-                    )
-                ]) {
+                withCredentials([file(
+                    credentialsId: 'kuberconfig',
+                    variable: 'KUBECONFIG_FILE'
+                )]) {
                     bat '''
-                        kubectl --kubeconfig="%KUBECONFIG_FILE%" patch service foodie-service --type=merge -p "{\\"spec\\":{\\"selector\\":{\\"app\\":\\"foodie\\",\\"slot\\":\\"%TARGET_SLOT%\\"}}}"
+                        @echo off
+                        set "KUBECONFIG=%KUBECONFIG_FILE%"
+                        kubectl patch service %SERVICE_NAME% -p "{\\"spec\\":{\\"selector\\":{\\"app\\":\\"foodie\\",\\"slot\\":\\"%NEXT_SLOT%\\"}}}"
                         if errorlevel 1 exit /b 1
                     '''
-
-                    script {
-                        env.TRAFFIC_SWITCHED = 'true'
-                    }
                 }
             }
         }
 
         stage('Verify Deployment') {
             steps {
-                withCredentials([
-                    file(
-                        credentialsId: 'kuberconfig',
-                        variable: 'KUBECONFIG_FILE'
-                    )
-                ]) {
-                    bat '''
-                        kubectl --kubeconfig="%KUBECONFIG_FILE%" rollout status deployment/foodie-%TARGET_SLOT% --timeout=180s
-                        if errorlevel 1 exit /b 1
-
-                        kubectl --kubeconfig="%KUBECONFIG_FILE%" get deployments
-                        if errorlevel 1 exit /b 1
-
-                        kubectl --kubeconfig="%KUBECONFIG_FILE%" get pods -l app=foodie
-                        if errorlevel 1 exit /b 1
-
-                        kubectl --kubeconfig="%KUBECONFIG_FILE%" get service foodie-service
-                        if errorlevel 1 exit /b 1
-                    '''
-
-                    powershell '''
-                        $ready = $false
-
-                        for ($i = 0; $i -lt 12; $i++) {
-                            try {
-                                $response = Invoke-WebRequest `
-                                    -Uri "http://localhost:30012/" `
-                                    -TimeoutSec 5 `
-                                    -UseBasicParsing
-
-                                if ($response.StatusCode -eq 200) {
-                                    $ready = $true
-                                    break
-                                }
-                            }
-                            catch {
-                                Start-Sleep -Seconds 3
-                            }
+                powershell '''
+                    Start-Sleep -Seconds 5
+                    try {
+                        $response = Invoke-WebRequest -Uri "http://localhost:$env:NODE_PORT/" -UseBasicParsing -TimeoutSec 15
+                        if ($response.StatusCode -ne 200) {
+                            throw "Deployment verification failed"
                         }
-
-                        if (-not $ready) {
-                            throw "FoodieExpress health check failed."
-                        }
-
-                        Write-Host "FoodieExpress deployment verified."
-                    '''
-                }
+                        Write-Host "Food Ordering Portal is responding successfully."
+                    } catch {
+                        Write-Host "Verification failed. Rolling traffic back."
+                        kubectl --kubeconfig="$env:KUBECONFIG_FILE" patch service foodie-service -p "{\\"spec\\":{\\"selector\\":{\\"app\\":\\"foodie\\",\\"slot\\":\\"$env:ACTIVE_SLOT\\"}}}"
+                        exit 1
+                    }
+                '''
             }
         }
     }
 
     post {
         always {
-            bat 'docker rm -f foodie-test-%BUILD_NUMBER% 2>NUL'
+            bat 'docker rm -f foodie-test 2>NUL & exit /b 0'
         }
 
         success {
-            echo 'FoodieExpress CI/CD and blue-green release completed successfully.'
+            echo 'Blue-green deployment completed successfully.'
+            echo 'Application URL: http://localhost:30012'
         }
 
         failure {
-            echo 'Pipeline failed. Checking whether traffic needs to be restored.'
-
-            script {
-                if (env.TRAFFIC_SWITCHED == 'true' &&
-                    (env.PREVIOUS_SLOT == 'blue' ||
-                     env.PREVIOUS_SLOT == 'green')) {
-
-                    withCredentials([
-                        file(
-                            credentialsId: 'kuberconfig',
-                            variable: 'KUBECONFIG_FILE'
-                        )
-                    ]) {
-                        bat '''
-                            kubectl --kubeconfig="%KUBECONFIG_FILE%" patch service foodie-service --type=merge -p "{\\"spec\\":{\\"selector\\":{\\"app\\":\\"foodie\\",\\"slot\\":\\"%PREVIOUS_SLOT%\\"}}}"
-                            if errorlevel 1 exit /b 1
-                        '''
-
-                        echo 'Traffic restoration to the previous slot was requested.'
-                    }
-                } else {
-                    echo 'Traffic was not switched; the existing active environment was left unchanged.'
-                }
-            }
+            echo 'Pipeline failed. Check Console Output for the failing stage.'
         }
     }
 }
